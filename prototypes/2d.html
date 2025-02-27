@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Plastic Deformable Body Physics Demo</title>
+  <style>
+    body { margin: 0; padding: 20px; text-align: center; font-family: sans-serif; }
+    #canvas { background: #f0f0f0; display: block; margin: 20px auto; border: 1px solid #ccc; }
+    #controls { margin: 10px; }
+  </style>
+</head>
+<body>
+  <div id="controls">
+    <button id="reset">Reset Simulation</button>
+  </div>
+  <canvas id="canvas" width="800" height="600"></canvas>
+  <script>
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const width = canvas.width;
+    const height = canvas.height;
+    const gravity = 0.5;
+    const friction = 0.99;
+    
+    // Node class using Verlet integration.
+    class Node {
+      constructor(x, y) {
+        this.x = x;
+        this.y = y;
+        this.oldx = x;
+        this.oldy = y;
+        this.dragged = false;
+      }
+      
+      update() {
+        if (!this.dragged) {
+          let vx = (this.x - this.oldx) * friction;
+          let vy = (this.y - this.oldy) * friction;
+          
+          this.oldx = this.x;
+          this.oldy = this.y;
+          
+          this.x += vx;
+          this.y += vy;
+          
+          // Apply gravity.
+          this.y += gravity;
+          
+          // Collision with floor.
+          if (this.y > height - 10) {
+            this.y = height - 10;
+            this.oldy = this.y + vy * -0.5;
+          }
+          
+          // Horizontal bounds.
+          if (this.x < 10) {
+            this.x = 10;
+            this.oldx = this.x + vx * -0.5;
+          } else if (this.x > width - 10) {
+            this.x = width - 10;
+            this.oldx = this.x + vx * -0.5;
+          }
+        }
+      }
+    }
+    
+    // Constraint (spring) class with plastic deformation.
+    class Constraint {
+      constructor(p1, p2, stiffness = 0.5, plasticity = { yield: 5, factor: .1 } ) {
+        this.p1 = p1;
+        this.p2 = p2;
+        this.stiffness = stiffness;
+        // Initial rest length.
+        this.length = distance(p1, p2);
+        // Yield threshold: if deformation (in pixels) exceeds this, start permanent change.
+        this.yieldThreshold = plasticity.yield;
+        // Plasticity factor: fraction of the deformation to add to rest length.
+        this.plasticityFactor = plasticity.factor;
+      }
+      
+      solve() {
+        const dx = this.p2.x - this.p1.x;
+        const dy = this.p2.y - this.p1.y;
+        const d = Math.sqrt(dx * dx + dy * dy);
+        const diff = (d - this.length) / d;
+        
+        // If the deviation is large enough, update the rest length.
+        if (Math.abs(d - this.length) > this.yieldThreshold) {
+          this.length += (d - this.length) * this.plasticityFactor;
+        }
+        
+        const offsetX = dx * 0.5 * diff * this.stiffness;
+        const offsetY = dy * 0.5 * diff * this.stiffness;
+        
+        this.p1.x += offsetX;
+        this.p1.y += offsetY;
+        this.p2.x -= offsetX;
+        this.p2.y -= offsetY;
+      }
+    }
+    
+    // Utility: compute distance between two nodes.
+    function distance(p1, p2) {
+      const dx = p1.x - p2.x;
+      const dy = p1.y - p2.y;
+      return Math.sqrt(dx * dx + dy * dy);
+    }
+    
+    let nodes = [];
+    let constraints = [];
+    
+    // Initialize simulation nodes and constraints.
+    function init() {
+      nodes = [];
+      constraints = [];
+      
+      // Create nodes representing a simplified "car."
+      nodes.push(new Node(350, 100)); // top left.
+      nodes.push(new Node(450, 100)); // top right.
+      nodes.push(new Node(450, 150)); // bottom right.
+      nodes.push(new Node(350, 150)); // bottom left.
+      
+      // Center node for additional rigidity.
+      const center = new Node(400, 125);
+      nodes.push(center);
+      
+      // Chassis (rectangle) with high stiffness so edges stay relatively rigid.
+      constraints.push(new Constraint(nodes[0], nodes[1], 0.8));
+      constraints.push(new Constraint(nodes[1], nodes[2], 0.8));
+      constraints.push(new Constraint(nodes[2], nodes[3], 0.8));
+      constraints.push(new Constraint(nodes[3], nodes[0], 0.8));
+      
+      // Diagonals for extra rigidity.
+      constraints.push(new Constraint(nodes[0], nodes[2], 0.8));
+      constraints.push(new Constraint(nodes[1], nodes[3], 0.8));
+      
+      // Connect each corner to the center with lower stiffness.
+      // These allow for visible dents that persist when deformed.
+      for (let i = 0; i < 4; i++) {
+        constraints.push(new Constraint(nodes[i], center, 0.2));
+      }
+    }
+    
+    init();
+    
+    // Collision resolution between nodes.
+    function resolveCollisions() {
+      const radius = 5;
+      const minDist = radius * 2;
+      for (let i = 0; i < nodes.length; i++) {
+        for (let j = i + 1; j < nodes.length; j++) {
+          let dx = nodes[j].x - nodes[i].x;
+          let dy = nodes[j].y - nodes[i].y;
+          let dist = Math.sqrt(dx * dx + dy * dy);
+          if (dist < minDist && dist > 0) {
+            let overlap = (minDist - dist) / 2;
+            let offsetX = (dx / dist) * overlap;
+            let offsetY = (dy / dist) * overlap;
+            nodes[i].x -= offsetX;
+            nodes[i].y -= offsetY;
+            nodes[j].x += offsetX;
+            nodes[j].y += offsetY;
+          }
+        }
+      }
+    }
+    
+    // --- Mouse Interaction ---
+    let selectedNode = null;
+    let dragOffsetX = 0;
+    let dragOffsetY = 0;
+    
+    canvas.addEventListener('mousedown', function(e) {
+      let rect = canvas.getBoundingClientRect();
+      let mouseX = e.clientX - rect.left;
+      let mouseY = e.clientY - rect.top;
+      for (let node of nodes) {
+        let dx = node.x - mouseX;
+        let dy = node.y - mouseY;
+        if (Math.sqrt(dx * dx + dy * dy) < 10) {
+          selectedNode = node;
+          node.dragged = true;
+          dragOffsetX = node.x - mouseX;
+          dragOffsetY = node.y - mouseY;
+          break;
+        }
+      }
+    });
+    
+    canvas.addEventListener('mousemove', function(e) {
+      if (selectedNode) {
+        let rect = canvas.getBoundingClientRect();
+        let mouseX = e.clientX - rect.left;
+        let mouseY = e.clientY - rect.top;
+        selectedNode.x = mouseX + dragOffsetX;
+        selectedNode.y = mouseY + dragOffsetY;
+        selectedNode.oldx = selectedNode.x;
+        selectedNode.oldy = selectedNode.y;
+      }
+    });
+    
+    canvas.addEventListener('mouseup', function() {
+      if (selectedNode) {
+        selectedNode.dragged = false;
+      }
+      selectedNode = null;
+    });
+    
+    canvas.addEventListener('mouseleave', function() {
+      if (selectedNode) {
+        selectedNode.dragged = false;
+      }
+      selectedNode = null;
+    });
+    
+    // Reset button functionality.
+    document.getElementById('reset').addEventListener('click', function() {
+      init();
+    });
+    
+    // Main simulation loop.
+    function update() {
+      nodes.forEach(node => node.update());
+      // Solve constraints repeatedly for stability.
+      for (let i = 0; i < 5; i++) {
+        constraints.forEach(constraint => constraint.solve());
+        resolveCollisions();
+      }
+    }
+    
+    function draw() {
+      ctx.clearRect(0, 0, width, height);
+      
+      // Draw constraints as lines.
+      ctx.strokeStyle = 'black';
+      constraints.forEach(constraint => {
+        ctx.beginPath();
+        ctx.moveTo(constraint.p1.x, constraint.p1.y);
+        ctx.lineTo(constraint.p2.x, constraint.p2.y);
+        ctx.stroke();
+      });
+      
+      // Draw nodes as red circles.
+      ctx.fillStyle = 'red';
+      nodes.forEach(node => {
+        ctx.beginPath();
+        ctx.arc(node.x, node.y, 5, 0, Math.PI * 2);
+        ctx.fill();
+      });
+    }
+    
+    function loop() {
+      update();
+      draw();
+      requestAnimationFrame(loop);
+    }
+    
+    loop();
+  </script>
+</body>
+</html>
