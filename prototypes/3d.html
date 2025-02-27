@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>3D Plastic Deformable Body Physics Demo</title>
+  <style>
+    body { margin: 0; padding: 20px; font-family: sans-serif; background: #eee; }
+    #container { width: 100%; height: 90vh; display: block; }
+    #controls { text-align: center; margin-top: 10px; }
+    button { font-size: 16px; padding: 5px 10px; }
+  </style>
+</head>
+<body>
+  <div id="container"></div>
+  <div id="controls">
+    <button id="reset">Reset Simulation</button>
+  </div>
+  <!-- Three.js from CDN -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script>
+    // ----- Simulation & Rendering Setup -----
+    let scene, camera, renderer, raycaster, mouse;
+    let simulationNodes = [];
+    let simulationConstraints = [];
+    let nodeMeshes = [];       // sphere meshes representing nodes
+    let constraintLines = [];  // line objects representing constraints
+    const clock = new THREE.Clock();
+    const dragPlane = new THREE.Plane();
+    let draggedNode = null;
+    let offset = new THREE.Vector3();
+
+    // Gravity (in negative Y, since Three.js uses Y-up)
+    const gravity = 0.8;
+
+    // Floor level (Y coordinate)
+    const floorY = -100;
+
+    // Create Three.js scene, camera, renderer
+    function initThree() {
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0xf0f0f0);
+      
+      const width = window.innerWidth;
+      const height = window.innerHeight * 0.9;
+      camera = new THREE.PerspectiveCamera(45, width/height, 1, 1000);
+      camera.position.set(0, 50, 300);
+      camera.lookAt(scene.position);
+      
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(width, height);
+      document.getElementById('container').appendChild(renderer.domElement);
+      
+      // Add a grid (ground) helper.
+      const gridHelper = new THREE.GridHelper(500, 20);
+      gridHelper.position.y = floorY;
+      scene.add(gridHelper);
+      
+      // Set up raycaster and mouse vector.
+      raycaster = new THREE.Raycaster();
+      mouse = new THREE.Vector2();
+    }
+
+    // ----- Physics Simulation Classes (3D) -----
+
+    // Node class using Verlet integration in 3D.
+    class Node {
+      constructor(x, y, z) {
+        this.position = new THREE.Vector3(x, y, z);
+        this.oldPosition = this.position.clone();
+        this.dragged = false;
+      }
+      
+      update() {
+        if (!this.dragged) {
+          // Verlet integration: compute velocity from difference.
+          const velocity = this.position.clone().sub(this.oldPosition).multiplyScalar(0.99);
+          // Save current state.
+          this.oldPosition.copy(this.position);
+          // Update position.
+          this.position.add(velocity);
+          // Apply gravity (only in Y direction)
+          this.position.y -= gravity;
+          // Simple floor collision:
+          if (this.position.y < floorY + 5) { // radius ~5
+            this.position.y = floorY + 5;
+            // Bounce back a bit (reverse velocity on Y)
+            this.oldPosition.y = this.position.y + velocity.y * -0.5;
+          }
+        }
+      }
+    }
+
+    // Constraint (spring) class with plastic deformation.
+    class Constraint {
+      constructor(nodeA, nodeB, stiffness = 1, plasticity = { yield: 2, factor: 0.5 }) {
+        this.nodeA = nodeA;
+        this.nodeB = nodeB;
+        this.stiffness = stiffness;
+        // Set the rest length from the initial distance.
+        this.restLength = nodeA.position.distanceTo(nodeB.position);
+        this.yieldThreshold = plasticity.yield;
+        this.plasticityFactor = plasticity.factor;
+      }
+      
+      solve() {
+        const diff = new THREE.Vector3().subVectors(this.nodeB.position, this.nodeA.position);
+        const d = diff.length();
+        if(d === 0) return;
+        // Check if the constraint is overstretched beyond the yield threshold.
+        if (Math.abs(d - this.restLength) > this.yieldThreshold) {
+          this.restLength += (d - this.restLength) * this.plasticityFactor;
+        }
+        // Compute correction factor.
+        const correction = diff.multiplyScalar((d - this.restLength) / d * 0.5 * this.stiffness);
+        this.nodeA.position.add(correction);
+        this.nodeB.position.sub(correction);
+      }
+    }
+
+    // ----- Create Simulation Object (a deformable "box") -----
+
+    // We'll construct a box-like structure: 8 corners of a cuboid and one center node.
+    // You can think of this as a crude approximation of a car chassis.
+    function createSimulation() {
+      simulationNodes = [];
+      simulationConstraints = [];
+      // Remove old meshes from scene (if any).
+      nodeMeshes.forEach(mesh => scene.remove(mesh));
+      constraintLines.forEach(line => scene.remove(line));
+      nodeMeshes = [];
+      constraintLines = [];
+
+      // Define half-dimensions of the box.
+      const hw = 50, hh = 30, hd = 30;
+      // 8 corners:
+      const corners = [
+        new Node(-hw, -hh, -hd), // 0
+        new Node(hw, -hh, -hd),  // 1
+        new Node(hw, hh, -hd),   // 2
+        new Node(-hw, hh, -hd),  // 3
+        new Node(-hw, -hh, hd),  // 4
+        new Node(hw, -hh, hd),   // 5
+        new Node(hw, hh, hd),    // 6
+        new Node(-hw, hh, hd)    // 7
+      ];
+      corners.forEach(n => simulationNodes.push(n));
+      
+      // Center node:
+      const center = new Node(0, 0, 0);
+      simulationNodes.push(center);
+      
+      // Helper to add constraint and create its visual line.
+      function addConstraint(a, b, stiffness, plasticity) {
+        const c = new Constraint(a, b, stiffness, plasticity);
+        simulationConstraints.push(c);
+        // Create a line for visualization.
+        const geometry = new THREE.BufferGeometry();
+        const positions = new Float32Array(6); // 2 points x 3 coordinates
+        geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        const material = new THREE.LineBasicMaterial({ color: 0x000000 });
+        const line = new THREE.Line(geometry, material);
+        constraintLines.push(line);
+        scene.add(line);
+      }
+      
+      // Create sphere meshes for each node.
+      simulationNodes.forEach(node => {
+        const geometry = new THREE.SphereGeometry(5, 16, 16);
+        const material = new THREE.MeshBasicMaterial({ color: 0xff0000 }); 
+        const sphere = new THREE.Mesh(geometry, material);
+        sphere.position.copy(node.position);
+        nodeMeshes.push(sphere);
+        scene.add(sphere);
+      });
+      
+      // Define plasticity parameters.
+      const plasticity = { yield: 200, factor: 0.1 };
+      
+      // Add constraints along edges of the cuboid (stiffer for chassis)
+      const edgeStiffness = 01;
+      // Bottom face edges
+      addConstraint(corners[0], corners[1], edgeStiffness, plasticity);
+      addConstraint(corners[1], corners[5], edgeStiffness, plasticity);
+      addConstraint(corners[5], corners[4], edgeStiffness, plasticity);
+      addConstraint(corners[4], corners[0], edgeStiffness, plasticity);
+      // Top face edges
+      addConstraint(corners[3], corners[2], edgeStiffness, plasticity);
+      addConstraint(corners[2], corners[6], edgeStiffness, plasticity);
+      addConstraint(corners[6], corners[7], edgeStiffness, plasticity);
+      addConstraint(corners[7], corners[3], edgeStiffness, plasticity);
+      // Vertical edges
+      addConstraint(corners[0], corners[3], edgeStiffness, plasticity);
+      addConstraint(corners[1], corners[2], edgeStiffness, plasticity);
+      addConstraint(corners[5], corners[6], edgeStiffness, plasticity);
+      addConstraint(corners[4], corners[7], edgeStiffness, plasticity);
+      
+      // Diagonals across faces (for extra rigidity)
+      addConstraint(corners[0], corners[5], edgeStiffness, plasticity);
+      addConstraint(corners[1], corners[4], edgeStiffness, plasticity);
+      addConstraint(corners[3], corners[6], edgeStiffness, plasticity);
+      addConstraint(corners[2], corners[7], edgeStiffness, plasticity);
+      
+      // Connect each corner to the center with lower stiffness for visible permanent dents.
+      const centerStiffness = 0.5;
+      corners.forEach(corner => {
+        addConstraint(corner, center, centerStiffness, plasticity);
+      });
+    }
+
+    // ----- Mouse Interaction for Dragging Nodes -----
+
+    function onMouseDown(event) {
+      event.preventDefault();
+      // Calculate mouse position in normalized device coordinates (-1 to +1)
+      const rect = renderer.domElement.getBoundingClientRect();
+      mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = - ((event.clientY - rect.top) / rect.height) * 2 + 1;
+      
+      raycaster.setFromCamera(mouse, camera);
+      // Intersect with node meshes.
+      const intersects = raycaster.intersectObjects(nodeMeshes);
+      if (intersects.length > 0) {
+        // Select the first intersected node.
+        draggedNode = simulationNodes[nodeMeshes.indexOf(intersects[0].object)];
+        draggedNode.dragged = true;
+        // Setup a plane perpendicular to camera's look direction at the intersection point.
+        dragPlane.setFromNormalAndCoplanarPoint(
+          camera.getWorldDirection(new THREE.Vector3()),
+          intersects[0].point
+        );
+        // Compute offset between node position and intersection.
+        offset.copy(intersects[0].point).sub(draggedNode.position);
+      }
+    }
+    
+    function onMouseMove(event) {
+      if (!draggedNode) return;
+      const rect = renderer.domElement.getBoundingClientRect();
+      mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = - ((event.clientY - rect.top) / rect.height) * 2 + 1;
+      raycaster.setFromCamera(mouse, camera);
+      // Find intersection point with the drag plane.
+      const intersection = new THREE.Vector3();
+      raycaster.ray.intersectPlane(dragPlane, intersection);
+      if (intersection) {
+        draggedNode.position.copy(intersection.sub(offset));
+        // Also update the old position to prevent snapping.
+        draggedNode.oldPosition.copy(draggedNode.position);
+      }
+    }
+    
+    function onMouseUp() {
+      if (draggedNode) {
+        draggedNode.dragged = false;
+      }
+      draggedNode = null;
+    }
+    
+    // ----- Simulation Update & Rendering Loop -----
+
+    function updateSimulation() {
+      // Update all nodes.
+      simulationNodes.forEach(node => node.update());
+      // Solve constraints repeatedly for stability.
+      for (let i = 0; i < 5; i++) {
+        simulationConstraints.forEach(constraint => constraint.solve());
+      }
+    }
+    
+    function updateMeshes() {
+      // Update sphere positions.
+      simulationNodes.forEach((node, i) => {
+        nodeMeshes[i].position.copy(node.position);
+      });
+      // Update constraint lines.
+      simulationConstraints.forEach((constraint, i) => {
+        const posArray = constraintLines[i].geometry.attributes.position.array;
+        posArray[0] = constraint.nodeA.position.x;
+        posArray[1] = constraint.nodeA.position.y;
+        posArray[2] = constraint.nodeA.position.z;
+        posArray[3] = constraint.nodeB.position.x;
+        posArray[4] = constraint.nodeB.position.y;
+        posArray[5] = constraint.nodeB.position.z;
+        constraintLines[i].geometry.attributes.position.needsUpdate = true;
+      });
+    }
+    
+    function animate() {
+      requestAnimationFrame(animate);
+      updateSimulation();
+      updateMeshes();
+      renderer.render(scene, camera);
+    }
+    
+    // ----- Initialization -----
+    function init() {
+      initThree();
+      createSimulation();
+      animate();
+      // Add event listeners for mouse interaction.
+      renderer.domElement.addEventListener('mousedown', onMouseDown, false);
+      renderer.domElement.addEventListener('mousemove', onMouseMove, false);
+      renderer.domElement.addEventListener('mouseup', onMouseUp, false);
+      renderer.domElement.addEventListener('mouseleave', onMouseUp, false);
+    }
+    
+    init();
+    
+    // Reset button reinitializes the simulation.
+    document.getElementById('reset').addEventListener('click', function() {
+      createSimulation();
+    });
+
+    // Adjust renderer size on window resize.
+    window.addEventListener('resize', function() {
+      const width = window.innerWidth;
+      const height = window.innerHeight * 0.9;
+      camera.aspect = width / height;
+      camera.updateProjectionMatrix();
+      renderer.setSize(width, height);
+    });
+  </script>
+</body>
+</html>
